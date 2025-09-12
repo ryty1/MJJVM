@@ -10,6 +10,7 @@ import telegram
 from telegram.ext import Updater, CommandHandler
 import logging
 from logging.handlers import RotatingFileHandler
+from telegram.error import BadRequest
 import threading
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import warnings
@@ -22,7 +23,6 @@ URLS = {
     "星耀区": "https://www.mjjvm.com/cart?fid=1&gid=4",
     "特别活动区": "https://www.mjjvm.com/cart?fid=1&gid=6",
 }
-
 
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -264,27 +264,34 @@ REGION_FLAGS = {
     "特别活动区": "🎁",
 }
 
-# 固定路径
-SERVERS_JSON_PATH = "/opt/cloudive/servers.json"
-
-
-def load_servers_data():
-    """读取 Cloudive 服务器数据"""
-    if not os.path.exists(SERVERS_JSON_PATH):
-        return []
-    try:
-        with open(SERVERS_JSON_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("servers", [])
-    except Exception as e:
-        logger.error("读取 servers.json 失败: %s", e)
-        return []
-
+def delete_after(context, chat_id, msg_ids, delay):
+    """延迟删除消息"""
+    def _delete():
+        time.sleep(delay)
+        for mid in msg_ids:
+            try:
+                context.bot.delete_message(chat_id, mid)
+            except Exception as e:
+                logger.error("删除消息失败: %s", e)
+            time.sleep(0.2)
+    threading.Thread(target=_delete, daemon=True).start()
 
 def vps_command(update, context):
-    """手动查看当前所有地区的商品库存"""
-    # --- 第一部分：库存数据 (MJJVM) ---
-    current_data = load_previous_data()
+    """手动查看当前所有地区的商品库存 (仅群管理员可用)"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    # --- 权限检查 ---
+    try:
+        member = context.bot.get_chat_member(chat_id, user_id)
+        if member.status not in ["administrator", "creator"]:
+            return
+    except BadRequest as e:
+        logger.error("获取用户权限失败: %s", e)
+        return
+
+    # --- 读取缓存数据 ---
+    current_data = load_previous_data()  # stock_data.json
     mjjvm_lines = []
 
     if not current_data:
@@ -292,58 +299,33 @@ def vps_command(update, context):
     else:
         for region, products in current_data.items():
             flag = REGION_FLAGS.get(region, "🌍")
-            mjjvm_lines.append(f"{flag} {region}:")
+            mjjvm_lines.append(f"{flag} <b>{region}</b>:")
             for p in products:
                 stock = p.get("stock")
-                # 判断库存状态
                 if stock is None or stock < 0:
-                    status = "🟡"
-                    stock_text = "未知"
+                    status, stock_text = "🟡", "未知"
                 elif stock == 0:
-                    status = "🔴"
-                    stock_text = "0"
+                    status, stock_text = "🔴", "0"
                 else:
-                    status = "🟢"
-                    stock_text = str(stock)
+                    status, stock_text = "🟢", str(stock)
 
-                # 判断会员等级显示
                 member_level = p.get("member_only", 0)
-                if member_level == 0:
-                    vip = "月费服务"
-                else:
-                    vip_name = MEMBER_NAME_MAP.get(member_level, "会员")
-                    vip = f"{vip_name}"
+                vip = "月费服务" if member_level == 0 else MEMBER_NAME_MAP.get(member_level, "会员")
 
                 name = p.get("name", "未知商品")
                 mjjvm_lines.append(f"   {status} {name} | 库存: {stock_text} | {vip}")
             mjjvm_lines.append("")
 
-    mjjvm_block = "━━━━━━━━━━━━━━━━━━\n" + "\n".join(mjjvm_lines)
-    
-    # --- 拼接最终消息 ---
-    final_text = "🖥️ VPS库存情况：\n" + mjjvm_block
+    final_text = "🖥️ VPS库存情况：\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(mjjvm_lines)
 
     sent_msg = context.bot.send_message(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         text=final_text,
         parse_mode=telegram.ParseMode.HTML
     )
 
-    # --- 定时删除 ---
-    def delete_msg():
-        time.sleep(60)
-        try:
-            context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-        except Exception as e:
-            logger.error("删除用户消息失败: %s", e)
-        time.sleep(0.5)
-        try:
-            context.bot.delete_message(update.effective_chat.id, sent_msg.message_id)
-            
-        except Exception as e:
-            logger.error("删除机器人消息失败: %s", e)
-
-    threading.Thread(target=delete_msg, daemon=True).start()
+    # 60秒后删除
+    delete_after(context, chat_id, [update.message.message_id, sent_msg.message_id], 10)
 
 # ---------------------------- TG Bot 启动 ----------------------------
 def start_telegram_bot():
